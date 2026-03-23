@@ -4,7 +4,7 @@ dotenv.config();
 export const config = {
   mnemonic: process.env.MNEMONIC || '',
   port: Number(process.env.PORT ?? 8080),
-  assets: (process.env.ASSETS || 'ethereum,bitcoin').split(',').map(a => a.trim()),
+  assets: (process.env.ASSETS || 'ethereum,bitcoin,solana,chainlink,uniswap,aave').split(',').map(a => a.trim()),
   priceIntervalMs: parseInt(process.env.PRICE_INTERVAL_MS || '300000', 10),
 
   // Base chain
@@ -20,7 +20,8 @@ export const config = {
   enableOnchainAttestation: process.env.ENABLE_ONCHAIN !== 'false',
 } as const;
 
-// Well-known token addresses on Base for DexScreener lookups
+// Token addresses on Base for DexScreener lookups
+// Assets without an entry here still get 2/3 sources (CoinGecko + DeFiLlama)
 export const BASE_TOKEN_ADDRESSES: Record<string, string> = {
   ethereum: '0x4200000000000000000000000000000000000006', // WETH on Base
   bitcoin: '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf',  // cbBTC on Base

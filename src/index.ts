@@ -2,8 +2,9 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { verifyMessage } from 'viem';
 import { config } from './config.js';
-import { fetchPrices, type PriceResult } from './oracle.js';
+import { fetchAllPrices, type PriceResult } from './oracle.js';
 import { Attestor, type AttestedPrice, type AttestationRecord } from './attestation.js';
+import { getDashboardHtml } from './dashboard.js';
 
 async function main() {
   if (!config.mnemonic) {
@@ -53,9 +54,10 @@ async function main() {
     loopRunning = true;
 
     console.log(`[oracle] Fetching prices for: ${config.assets.join(', ')}`);
-    for (const asset of config.assets) {
+    const allResults = await fetchAllPrices(config.assets);
+    for (const result of allResults) {
       try {
-        const result = await fetchPrices(asset);
+        const asset = result.asset;
         console.log(
           `[oracle] ${asset} = $${result.median.toFixed(2)} ` +
           `(${result.sourceCount}/3 sources` +
@@ -101,7 +103,7 @@ async function main() {
           priceHistory.splice(0, priceHistory.length - MAX_HISTORY);
         }
       } catch (err: any) {
-        console.error(`[oracle] Error for ${asset}: ${err.message}`);
+        console.error(`[oracle] Error for ${result.asset}: ${err.message}`);
       }
     }
 
@@ -113,6 +115,11 @@ async function main() {
 
   // CORS
   await server.register(cors, { origin: true });
+
+  // Dashboard
+  server.get('/', async (_request, reply) => {
+    reply.type('text/html').send(getDashboardHtml());
+  });
 
   // Health check
   server.get('/health', async () => {
