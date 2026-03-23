@@ -1,15 +1,18 @@
-FROM node:22-alpine
+FROM node:22.16.0-alpine
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
 
 COPY src/ ./src/
 COPY tsconfig.json ./
 
 RUN npm run build
 
+# Remove dev dependencies after build
+RUN npm prune --production
+
 EXPOSE 8080
 
-CMD ["npm", "start"]
+CMD ["node", "dist/index.js"]

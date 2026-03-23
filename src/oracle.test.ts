@@ -1,21 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-
-// --- Test computeMedian ---
-function computeMedian(values: number[]): number {
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0
-    ? (sorted[mid - 1] + sorted[mid]) / 2
-    : sorted[mid];
-}
-
-function detectOutlier(prices: number[], median: number): { outlierDetected: boolean; maxDeviation: number } {
-  if (median === 0 || prices.length < 2) return { outlierDetected: false, maxDeviation: 0 };
-  const deviations = prices.map(p => Math.abs((p - median) / median) * 100);
-  const maxDeviation = Math.max(...deviations);
-  return { outlierDetected: maxDeviation > 2, maxDeviation: Math.round(maxDeviation * 100) / 100 };
-}
+import { computeMedian, detectOutlier } from './oracle.js';
 
 describe('computeMedian', () => {
   it('returns the middle value for odd-length arrays', () => {
@@ -30,6 +15,10 @@ describe('computeMedian', () => {
 
   it('handles single value', () => {
     assert.equal(computeMedian([42]), 42);
+  });
+
+  it('handles empty array', () => {
+    assert.equal(computeMedian([]), 0);
   });
 
   it('handles unsorted input', () => {
@@ -59,7 +48,7 @@ describe('detectOutlier', () => {
   });
 
   it('detects outlier when one source diverges >2%', () => {
-    const prices = [2000, 2001, 2100]; // 2100 is ~5% off
+    const prices = [2000, 2001, 2100];
     const median = computeMedian(prices);
     const result = detectOutlier(prices, median);
     assert.equal(result.outlierDetected, true);
@@ -74,6 +63,13 @@ describe('detectOutlier', () => {
   it('handles single source', () => {
     const result = detectOutlier([2000], 2000);
     assert.equal(result.outlierDetected, false);
+  });
+
+  it('returns exact deviation percentage', () => {
+    // 100 is 100% off from median of 50
+    const result = detectOutlier([0, 100], 50);
+    assert.equal(result.outlierDetected, true);
+    assert.equal(result.maxDeviation, 100);
   });
 });
 

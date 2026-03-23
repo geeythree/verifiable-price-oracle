@@ -5,13 +5,15 @@ import {
   encodeAbiParameters,
   parseAbiParameters,
   hashMessage,
+  formatEther,
+  decodeEventLog,
   type PublicClient,
   type WalletClient,
   type Chain,
 } from 'viem';
 import { mnemonicToAccount, type HDAccount } from 'viem/accounts';
 import { base, baseSepolia } from 'viem/chains';
-import { config, PRICE_SCHEMA } from './config.js';
+import { type Config, PRICE_SCHEMA } from './config.js';
 import type { PriceResult } from './oracle.js';
 
 // --- EAS ABIs (minimal) ---
@@ -104,21 +106,36 @@ export interface AttestedPrice extends PriceResult {
   txHash?: string;
 }
 
+// --- Helpers ---
+
+function encodePriceData(result: PriceResult) {
+  const priceUsd = BigInt(Math.round(result.median * 1e8));
+  const timestamp = BigInt(Math.floor(result.timestamp / 1000));
+  const sourceNames = JSON.stringify(result.sources.map(s => s.name));
+
+  const encodedData = encodeAbiParameters(
+    parseAbiParameters('string asset, uint256 priceUsd, uint8 sourceCount, uint64 timestamp, string sources'),
+    [result.asset, priceUsd, result.sourceCount, timestamp, sourceNames]
+  );
+
+  return { priceUsd, timestamp, sourceNames, encodedData };
+}
+
 // --- Attestor ---
 
 export class Attestor {
-  private account: HDAccount;
-  private publicClient: PublicClient;
-  private walletClient: WalletClient;
-  private chain: Chain;
-  private schemaUid: `0x${string}`;
+  private readonly account: HDAccount;
+  private readonly publicClient: PublicClient;
+  private readonly walletClient: WalletClient;
+  private readonly chain: Chain;
+  private readonly config: Config;
 
-  constructor() {
+  constructor(config: Config) {
     if (!config.mnemonic) throw new Error('MNEMONIC not set');
 
+    this.config = config;
     this.account = mnemonicToAccount(config.mnemonic);
     this.chain = config.chainId === 84532 ? baseSepolia : base;
-    this.schemaUid = config.easSchemaUid;
 
     this.publicClient = createPublicClient({
       chain: this.chain,
@@ -138,19 +155,19 @@ export class Attestor {
 
   async getBalance(): Promise<string> {
     const bal = await this.publicClient.getBalance({ address: this.account.address });
-    return (Number(bal) / 1e18).toFixed(6);
+    return formatEther(bal);
   }
 
   async registerSchema(): Promise<`0x${string}`> {
-    if (this.schemaUid && this.schemaUid !== '0x') {
-      console.log(`[attestor] Schema already set: ${this.schemaUid}`);
-      return this.schemaUid;
+    if (this.config.easSchemaUid && this.config.easSchemaUid.length > 2) {
+      console.log(`[attestor] Schema already set: ${this.config.easSchemaUid}`);
+      return this.config.easSchemaUid;
     }
 
     console.log(`[attestor] Registering EAS schema: "${PRICE_SCHEMA}"`);
 
     const { request } = await this.publicClient.simulateContract({
-      address: config.schemaRegistry,
+      address: this.config.schemaRegistry,
       abi: SCHEMA_REGISTRY_ABI,
       functionName: 'register',
       args: [PRICE_SCHEMA, '0x0000000000000000000000000000000000000000', true],
@@ -160,26 +177,35 @@ export class Attestor {
     const txHash = await this.walletClient.writeContract(request);
     const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
 
-    // Extract schema UID from Registered event (first indexed topic after event sig)
-    const registeredLog = receipt.logs.find(l => l.topics.length >= 2);
-    if (!registeredLog?.topics[1]) throw new Error('No Registered event in receipt');
+    // Decode Registered event properly
+    let schemaUid: `0x${string}` | undefined;
+    for (const log of receipt.logs) {
+      try {
+        const decoded = decodeEventLog({
+          abi: SCHEMA_REGISTRY_ABI,
+          data: log.data,
+          topics: log.topics,
+        });
+        if (decoded.eventName === 'Registered') {
+          schemaUid = (decoded.args as { uid: `0x${string}` }).uid;
+          break;
+        }
+      } catch {
+        // Not our event, skip
+      }
+    }
 
-    this.schemaUid = registeredLog.topics[1] as `0x${string}`;
-    console.log(`[attestor] Schema registered: ${this.schemaUid}`);
-    console.log(`[attestor] Set EAS_SCHEMA_UID=${this.schemaUid} in .env for future runs`);
-    return this.schemaUid;
+    if (!schemaUid) throw new Error('No Registered event found in receipt');
+
+    this.config.easSchemaUid = schemaUid;
+    console.log(`[attestor] Schema registered: ${schemaUid}`);
+    console.log(`[attestor] Set EAS_SCHEMA_UID=${schemaUid} in .env for future runs`);
+    return schemaUid;
   }
 
   // Off-chain signed attestation (always works, no gas needed)
   async signAttestation(result: PriceResult): Promise<AttestedPrice> {
-    const priceUsd = BigInt(Math.round(result.median * 1e8));
-    const timestamp = BigInt(Math.floor(result.timestamp / 1000));
-    const sourceNames = JSON.stringify(result.sources.map(s => s.name));
-
-    const encodedData = encodeAbiParameters(
-      parseAbiParameters('string asset, uint256 priceUsd, uint8 sourceCount, uint64 timestamp, string sources'),
-      [result.asset, priceUsd, result.sourceCount, timestamp, sourceNames]
-    );
+    const { priceUsd, timestamp, sourceNames, encodedData } = encodePriceData(result);
 
     const message = `PriceOracle|${result.asset}|${priceUsd.toString()}|${result.sourceCount}|${timestamp}|${sourceNames}`;
     const messageHash = hashMessage(message);
@@ -197,27 +223,20 @@ export class Attestor {
 
   // On-chain EAS attestation (requires gas)
   async attestOnchain(result: PriceResult): Promise<{ uid: string; txHash: string }> {
-    if (!this.schemaUid || this.schemaUid === '0x') {
+    if (!this.config.easSchemaUid || this.config.easSchemaUid.length <= 2) {
       throw new Error('Schema UID not set — call registerSchema() first');
     }
 
-    const priceUsd = BigInt(Math.round(result.median * 1e8));
-    const timestamp = BigInt(Math.floor(result.timestamp / 1000));
-    const sourceNames = JSON.stringify(result.sources.map(s => s.name));
-
-    const encodedData = encodeAbiParameters(
-      parseAbiParameters('string asset, uint256 priceUsd, uint8 sourceCount, uint64 timestamp, string sources'),
-      [result.asset, priceUsd, result.sourceCount, timestamp, sourceNames]
-    );
+    const { encodedData } = encodePriceData(result);
 
     console.log(`[attestor] On-chain attesting ${result.asset} = $${result.median.toFixed(2)} (${result.sourceCount} sources)`);
 
     const { request } = await this.publicClient.simulateContract({
-      address: config.easContract,
+      address: this.config.easContract,
       abi: EAS_ABI,
       functionName: 'attest',
       args: [{
-        schema: this.schemaUid,
+        schema: this.config.easSchemaUid,
         data: {
           recipient: '0x0000000000000000000000000000000000000000',
           expirationTime: 0n,
@@ -233,11 +252,22 @@ export class Attestor {
     const txHash = await this.walletClient.writeContract(request);
     const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
 
-    // Extract attestation UID from Attested event
-    const attestedLog = receipt.logs.find(l => l.topics.length >= 3);
+    // Decode Attested event properly
     let uid = '0x';
-    if (attestedLog && attestedLog.data) {
-      uid = attestedLog.data;
+    for (const log of receipt.logs) {
+      try {
+        const decoded = decodeEventLog({
+          abi: EAS_ABI,
+          data: log.data,
+          topics: log.topics,
+        });
+        if (decoded.eventName === 'Attested') {
+          uid = (decoded.args as { uid: `0x${string}` }).uid;
+          break;
+        }
+      } catch {
+        // Not our event, skip
+      }
     }
 
     console.log(`[attestor] Attestation UID: ${uid} (tx: ${txHash})`);

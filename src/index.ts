@@ -1,19 +1,25 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { verifyMessage } from 'viem';
-import { config } from './config.js';
-import { fetchAllPrices, type PriceResult } from './oracle.js';
+import { createConfig } from './config.js';
+import { PriceOracle } from './oracle.js';
 import { Attestor, type AttestedPrice, type AttestationRecord } from './attestation.js';
 import { getDashboardHtml } from './dashboard.js';
 
+const MAX_BODY_SIZE = 8192; // 8KB limit for POST /verify
+
 async function main() {
+  const config = createConfig();
+
   if (!config.mnemonic) {
     console.error('MNEMONIC environment variable is not set');
     process.exit(1);
   }
 
-  // --- Initialize Attestor ---
-  const attestor = new Attestor();
+  // --- Initialize ---
+  const attestor = new Attestor(config);
+  const oracle = new PriceOracle();
+
   console.log('=== Verifiable Price Oracle ===');
   console.log(`TEE wallet: ${attestor.address}`);
   console.log(`Assets: ${config.assets.join(', ')}`);
@@ -29,11 +35,12 @@ async function main() {
   }
 
   // Register schema if needed and wallet is funded
-  if (config.enableOnchainAttestation && !config.easSchemaUid && parseFloat(balance) > 0) {
+  if (config.enableOnchainAttestation && (!config.easSchemaUid || config.easSchemaUid.length <= 2) && parseFloat(balance) > 0) {
     try {
       await attestor.registerSchema();
-    } catch (err: any) {
-      console.error(`[attestor] Schema registration failed: ${err.message}`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[attestor] Schema registration failed: ${msg}`);
       console.warn('[attestor] Continuing with off-chain attestations only');
     }
   }
@@ -45,75 +52,97 @@ async function main() {
   const MAX_LOG = 100;
   const MAX_HISTORY = 500;
   const startTime = Date.now();
+  let consecutiveFailures = 0;
 
   // --- Price Loop ---
   let loopRunning = false;
 
   async function priceLoop() {
-    if (loopRunning) return; // prevent overlap
+    if (loopRunning) return;
     loopRunning = true;
 
-    console.log(`[oracle] Fetching prices for: ${config.assets.join(', ')}`);
-    const allResults = await fetchAllPrices(config.assets);
-    for (const result of allResults) {
-      try {
-        const asset = result.asset;
-        console.log(
-          `[oracle] ${asset} = $${result.median.toFixed(2)} ` +
-          `(${result.sourceCount}/3 sources` +
-          `${result.lowConfidence ? ', LOW CONFIDENCE' : ''}` +
-          `${result.outlierDetected ? `, OUTLIER ±${result.maxDeviation}%` : ''})`
-        );
+    try {
+      console.log(`[oracle] Fetching prices for: ${config.assets.join(', ')}`);
+      const allResults = await oracle.fetchAllPrices(config.assets);
 
-        if (result.lowConfidence || result.median <= 0) continue;
+      for (const result of allResults) {
+        try {
+          console.log(
+            `[oracle] ${result.asset} = $${result.median.toFixed(2)} ` +
+            `(${result.sourceCount}/3 sources` +
+            `${result.lowConfidence ? ', LOW CONFIDENCE' : ''}` +
+            `${result.outlierDetected ? `, OUTLIER ±${result.maxDeviation}%` : ''})`
+          );
 
-        // Always sign off-chain
-        const attested = await attestor.signAttestation(result);
+          if (result.lowConfidence || result.median <= 0) continue;
 
-        // Attempt on-chain EAS attestation
-        if (config.enableOnchainAttestation && config.easSchemaUid) {
-          try {
-            const { uid, txHash } = await attestor.attestOnchain(result);
-            attested.onchainUid = uid;
-            attested.txHash = txHash;
-          } catch (err: any) {
-            console.error(`[attestor] On-chain attestation failed for ${asset}: ${err.message}`);
+          const attested = await attestor.signAttestation(result);
+
+          // Attempt on-chain EAS attestation
+          if (config.enableOnchainAttestation && config.easSchemaUid && config.easSchemaUid.length > 2) {
+            try {
+              const { uid, txHash } = await attestor.attestOnchain(result);
+              attested.onchainUid = uid;
+              attested.txHash = txHash;
+            } catch (err: unknown) {
+              const msg = err instanceof Error ? err.message : String(err);
+              console.error(`[attestor] On-chain attestation failed for ${result.asset}: ${msg}`);
+            }
           }
-        }
 
-        priceCache.set(asset, attested);
+          priceCache.set(result.asset, attested);
 
-        attestationLog.push({
-          asset: attested.asset,
-          price: attested.median,
-          sourceCount: attested.sourceCount,
-          timestamp: attested.timestamp,
-          signature: attested.signature,
-          signer: attested.signer,
-          messageHash: attested.messageHash,
-          onchainUid: attested.onchainUid,
-          txHash: attested.txHash,
-        });
-        if (attestationLog.length > MAX_LOG) {
-          attestationLog.splice(0, attestationLog.length - MAX_LOG);
-        }
+          attestationLog.push({
+            asset: attested.asset,
+            price: attested.median,
+            sourceCount: attested.sourceCount,
+            timestamp: attested.timestamp,
+            signature: attested.signature,
+            signer: attested.signer,
+            messageHash: attested.messageHash,
+            onchainUid: attested.onchainUid,
+            txHash: attested.txHash,
+          });
+          if (attestationLog.length > MAX_LOG) {
+            attestationLog.splice(0, attestationLog.length - MAX_LOG);
+          }
 
-        priceHistory.push({ asset, price: result.median, timestamp: result.timestamp });
-        if (priceHistory.length > MAX_HISTORY) {
-          priceHistory.splice(0, priceHistory.length - MAX_HISTORY);
+          priceHistory.push({ asset: result.asset, price: result.median, timestamp: result.timestamp });
+          if (priceHistory.length > MAX_HISTORY) {
+            priceHistory.splice(0, priceHistory.length - MAX_HISTORY);
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[oracle] Error for ${result.asset}: ${msg}`);
         }
-      } catch (err: any) {
-        console.error(`[oracle] Error for ${result.asset}: ${err.message}`);
       }
-    }
 
-    loopRunning = false;
+      consecutiveFailures = 0;
+    } catch (err: unknown) {
+      consecutiveFailures++;
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[oracle] Price loop failed (${consecutiveFailures} consecutive): ${msg}`);
+    } finally {
+      loopRunning = false;
+    }
+  }
+
+  // --- Health Status ---
+
+  function getHealthStatus(): 'healthy' | 'degraded' | 'unhealthy' {
+    if (priceCache.size === 0 && Date.now() - startTime > 60_000) return 'unhealthy';
+    if (consecutiveFailures >= 3) return 'unhealthy';
+    if (consecutiveFailures >= 1) return 'degraded';
+    if (oracle.lastSuccess > 0 && Date.now() - oracle.lastSuccess > config.priceIntervalMs * 3) return 'degraded';
+    return 'healthy';
   }
 
   // --- Fastify Server ---
-  const server = Fastify({ logger: true });
+  const server = Fastify({
+    logger: true,
+    bodyLimit: MAX_BODY_SIZE,
+  });
 
-  // CORS
   await server.register(cors, { origin: true });
 
   // Dashboard
@@ -121,21 +150,25 @@ async function main() {
     reply.type('text/html').send(getDashboardHtml());
   });
 
-  // Health check
+  // Health check with depth
   server.get('/health', async () => {
     const bal = await attestor.getBalance().catch(() => 'unknown');
+    const status = getHealthStatus();
     return {
-      status: 'ok',
+      status,
       uptime: Math.floor((Date.now() - startTime) / 1000),
       wallet: attestor.address,
       balance: `${bal} ETH`,
       chain: config.chainId === 84532 ? 'Base Sepolia' : 'Base Mainnet',
-      schemaUid: config.easSchemaUid || 'not registered',
+      schemaUid: (config.easSchemaUid && config.easSchemaUid.length > 2) ? config.easSchemaUid : 'not registered',
       onchainAttestation: config.enableOnchainAttestation,
       assets: config.assets,
       intervalMs: config.priceIntervalMs,
       cachedAssets: Array.from(priceCache.keys()),
       totalAttestations: attestationLog.length,
+      consecutiveFailures,
+      lastSuccess: oracle.lastSuccess > 0 ? new Date(oracle.lastSuccess).toISOString() : null,
+      lastError: oracle.lastError,
     };
   });
 
@@ -148,15 +181,16 @@ async function main() {
     return { prices, count: priceCache.size };
   });
 
-  // Single asset price
+  // Single asset price — validated
   server.get<{ Params: { asset: string } }>('/prices/:asset', async (request, reply) => {
-    const result = priceCache.get(request.params.asset);
+    const { asset } = request.params;
+    const result = priceCache.get(asset);
     if (!result) {
       reply.code(404);
-      return { error: `No price data for ${request.params.asset}` };
+      return { error: `No price data for ${asset}` };
     }
     const history = priceHistory
-      .filter(h => h.asset === request.params.asset)
+      .filter(h => h.asset === asset)
       .slice(-20);
     return { ...result, history };
   });
@@ -180,14 +214,25 @@ async function main() {
     },
   }));
 
-  // Signature verification endpoint
+  // Signature verification endpoint — validated input
   server.post<{
     Body: { message: string; signature: string };
   }>('/verify', async (request, reply) => {
-    const { message, signature } = request.body || {};
-    if (!message || !signature) {
+    const body = request.body;
+    if (!body || typeof body !== 'object') {
       reply.code(400);
-      return { error: 'Required fields: message, signature' };
+      return { error: 'Invalid JSON body' };
+    }
+
+    const { message, signature } = body;
+    if (typeof message !== 'string' || typeof signature !== 'string') {
+      reply.code(400);
+      return { error: 'Required fields: message (string), signature (string)' };
+    }
+
+    if (!signature.startsWith('0x') || signature.length !== 132) {
+      reply.code(400);
+      return { error: 'Signature must be a 0x-prefixed 65-byte hex string (132 chars)' };
     }
 
     try {
@@ -205,9 +250,10 @@ async function main() {
           ? 'Signature verified — this attestation was signed by the TEE wallet'
           : 'Signature does NOT match the TEE wallet',
       };
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
       reply.code(400);
-      return { error: `Verification failed: ${err.message}` };
+      return { error: `Verification failed: ${msg}` };
     }
   });
 
