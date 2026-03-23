@@ -17,40 +17,107 @@ Traditional oracles require trusting the operator not to manipulate prices. This
 
 ## Architecture
 
+```mermaid
+graph TB
+    subgraph INTERNET["External Price Sources"]
+        CG["CoinGecko API<br/><i>batch query, retry:1</i>"]
+        DL["DeFiLlama API<br/><i>batch query, retry:1</i>"]
+        DS["DexScreener API<br/><i>per-asset, retry:1</i>"]
+    end
+
+    subgraph TEE["EigenCompute TEE (AMD SEV-SNP)"]
+        direction TB
+        ORACLE["PriceOracle<br/><b>Median Aggregation</b><br/>outlier detection >2%"]
+        WALLET["TEE Wallet<br/><i>derived from MNEMONIC</i><br/>key never leaves enclave"]
+        SIGN["Off-chain Signing<br/><i>EIP-191 message signature</i>"]
+        EAS_CALL["On-chain EAS attest()<br/><i>schema + ABI-encoded data</i>"]
+        API["Fastify API Server<br/>/health /prices /attestations<br/>/verify (GET + POST)"]
+        DASH["Live Dashboard<br/><i>auto-refresh 15s</i>"]
+    end
+
+    subgraph CHAIN["Base L2 (Chain ID: 8453)"]
+        EAS_CONTRACT["EAS Contract<br/>0x4200...0021<br/><i>immutable attestations</i>"]
+        SCHEMA["Schema Registry<br/>0x4200...0020"]
+    end
+
+    subgraph VERIFY["Verification Layer"]
+        EIGENCLOUD["EigenCloud Verification<br/><i>Source Code ✓</i><br/><i>Operating System ✓</i><br/><i>Hardware (TEE) ✓</i>"]
+        EASSCAN["Base EAS Explorer<br/><i>easscan.org</i>"]
+        SIG_VERIFY["Signature Recovery<br/><i>POST /verify</i><br/>ecrecover → TEE wallet"]
+    end
+
+    CG -->|"USD prices"| ORACLE
+    DL -->|"USD prices"| ORACLE
+    DS -->|"DEX prices"| ORACLE
+    ORACLE -->|"median price"| WALLET
+    WALLET --> SIGN
+    WALLET --> EAS_CALL
+    SIGN -->|"signed attestation"| API
+    EAS_CALL -->|"tx"| EAS_CONTRACT
+    SCHEMA -.->|"schema UID"| EAS_CALL
+    API --> DASH
+
+    EAS_CONTRACT -->|"verify"| EASSCAN
+    API -->|"verify"| SIG_VERIFY
+    TEE -->|"TEE attestation"| EIGENCLOUD
+
+    style TEE fill:#0d1117,stroke:#00d4ff,stroke-width:2px,color:#e0e0e0
+    style CHAIN fill:#0d1117,stroke:#00ff88,stroke-width:2px,color:#e0e0e0
+    style VERIFY fill:#0d1117,stroke:#ffaa00,stroke-width:2px,color:#e0e0e0
+    style INTERNET fill:#0d1117,stroke:#888,stroke-width:1px,color:#e0e0e0
+    style WALLET fill:#1a1a2e,stroke:#ff4444,stroke-width:2px,color:#ff4444
 ```
-┌──────────────────────────────────────────────────┐
-│            EigenCompute TEE (AMD SEV-SNP)         │
-│                                                   │
-│  ┌───────────┐  ┌───────────┐  ┌──────────────┐  │
-│  │ CoinGecko │  │ DeFiLlama │  │ DexScreener  │  │
-│  │ (retry:1) │  │ (retry:1) │  │  (retry:1)   │  │
-│  └─────┬─────┘  └─────┬─────┘  └──────┬───────┘  │
-│        └───────┬───────┴───────────────┘          │
-│           ┌────▼─────┐                            │
-│           │  Median   │  ← outlier detection      │
-│           │  + Sign   │    (>2% deviation flag)   │
-│           └────┬─────┘                            │
-│           ┌────▼──────────┐                       │
-│           │  TEE Wallet   │  ← key never leaves   │
-│           │  (MNEMONIC)   │    the enclave         │
-│           └──┬────────┬───┘                       │
-│              │        │                           │
-│   ┌──────────┤        │  Fastify API              │
-│   │ Off-chain│        │  /health  /prices         │
-│   │ signature│        │  /verify  /attestations   │
-└───┼──────────┼────────┼───────────────────────────┘
-    │          │        │
-    │          │        └─── HTTP consumers
-    │          │
-    │          │ EAS attest() on-chain
-    │          ▼
-    │   ┌────────────┐
-    │   │   Base L2   │  ← immutable price record
-    │   │ (EAS @0x21) │    verifiable on easscan.org
-    │   └────────────┘
-    │
-    └─── Off-chain: any client can recover signer
-         from signature via POST /verify
+
+### Why TEE is Structurally Necessary
+
+```mermaid
+graph LR
+    subgraph WITHOUT["Without TEE ❌"]
+        OP1["Operator"] -->|"can extract key"| FORGE["Forge attestations"]
+        OP1 -->|"can modify code"| MANIP["Manipulate prices"]
+    end
+
+    subgraph WITH["With EigenCompute TEE ✓"]
+        OP2["Operator"] -.->|"cannot access"| KEY["MNEMONIC<br/><i>hardware-encrypted</i>"]
+        OP2 -.->|"cannot modify"| CODE["Verified source code<br/><i>hash-locked</i>"]
+        KEY -->|"signs inside enclave"| TRUSTED["Verifiable attestation"]
+        CODE -->|"proven by TEE"| TRUSTED
+    end
+
+    style WITHOUT fill:#2d0000,stroke:#ff4444,color:#e0e0e0
+    style WITH fill:#0d2818,stroke:#00ff88,color:#e0e0e0
+    style KEY fill:#1a1a2e,stroke:#ff4444,stroke-width:2px,color:#ff4444
+```
+
+### Data Flow (per 5-minute cycle)
+
+```mermaid
+sequenceDiagram
+    participant Timer as Scheduler (5 min)
+    participant Oracle as PriceOracle
+    participant CG as CoinGecko
+    participant DL as DeFiLlama
+    participant DS as DexScreener
+    participant Wallet as TEE Wallet
+    participant EAS as Base EAS
+
+    Timer->>Oracle: fetchAllPrices()
+    par Batch fetch
+        Oracle->>CG: GET /simple/price?ids=eth,btc,sol,...
+        CG-->>Oracle: {eth: 2045, btc: 68370, ...}
+        Oracle->>DL: GET /prices/current/coingecko:eth,...
+        DL-->>Oracle: {coins: {...}}
+    end
+    loop Per asset with Base address
+        Oracle->>DS: GET /tokens/v1/base/{addr}
+        DS-->>Oracle: {priceUsd: "2045.29"}
+    end
+    Oracle->>Oracle: computeMedian() + detectOutlier()
+    Oracle->>Wallet: signMessage(price|asset|sources)
+    Wallet-->>Oracle: signature (0x...)
+    Oracle->>EAS: attest(schema, encodedData)
+    EAS-->>Oracle: attestation UID
+    Note over Oracle: Cache result + log attestation
 ```
 
 ## API Endpoints
