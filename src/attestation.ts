@@ -177,9 +177,11 @@ export class Attestor {
     const txHash = await this.walletClient.writeContract(request);
     const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
 
-    // Decode Registered event properly
+    // Extract schema UID from Registered event
+    // The UID is the first indexed topic (topics[1]) in the Registered(bytes32 indexed uid, address indexed registerer, ...) event
     let schemaUid: `0x${string}` | undefined;
     for (const log of receipt.logs) {
+      // Try decodeEventLog first
       try {
         const decoded = decodeEventLog({
           abi: SCHEMA_REGISTRY_ABI,
@@ -191,11 +193,19 @@ export class Attestor {
           break;
         }
       } catch {
-        // Not our event, skip
+        // Fallback: raw topic extraction — UID is topics[1] for Registered event
+        if (log.address.toLowerCase() === this.config.schemaRegistry.toLowerCase() && log.topics.length >= 2) {
+          schemaUid = log.topics[1] as `0x${string}`;
+          break;
+        }
       }
     }
 
-    if (!schemaUid) throw new Error('No Registered event found in receipt');
+    if (!schemaUid) {
+      // Last resort: check all logs for any with 2+ topics from the schema registry
+      console.error(`[attestor] Receipt logs:`, JSON.stringify(receipt.logs.map(l => ({ address: l.address, topics: l.topics }))));
+      throw new Error('No Registered event found in receipt');
+    }
 
     this.config.easSchemaUid = schemaUid;
     console.log(`[attestor] Schema registered: ${schemaUid}`);
@@ -252,7 +262,9 @@ export class Attestor {
     const txHash = await this.walletClient.writeContract(request);
     const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
 
-    // Decode Attested event properly
+    // Extract attestation UID from Attested event
+    // Attested(address indexed recipient, address indexed attester, bytes32 uid, bytes32 indexed schemaUID)
+    // uid is in the data field (non-indexed)
     let uid = '0x';
     for (const log of receipt.logs) {
       try {
@@ -266,7 +278,11 @@ export class Attestor {
           break;
         }
       } catch {
-        // Not our event, skip
+        // Fallback: uid is the first 32 bytes of log.data for Attested events from EAS contract
+        if (log.address.toLowerCase() === this.config.easContract.toLowerCase() && log.data && log.data.length >= 66) {
+          uid = `0x${log.data.slice(2, 66)}`;
+          break;
+        }
       }
     }
 
